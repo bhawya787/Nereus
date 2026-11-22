@@ -1,0 +1,8 @@
+{
+  "name": "Nereus — Indian Ocean Satellite Observatory",
+  "description": "Satellite-powered ocean health watch for India's coasts on a real-time 3D Earth globe: oil slicks, algal blooms, SST warming, coral heat stress, sea-level trends, ocean acidification, dark vessel leads, and floating debris candidates.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
