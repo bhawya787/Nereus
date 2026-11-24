@@ -8,6 +8,7 @@ import {
   evaluateOilWindWindow,
   buildGeoJsonFeatureCollection,
   parseNdbcLatestObs,
+  parseArgovisMinimalFloats,
 } from './nereusMath';
 import type { DetectionFeature } from '../types/nereus';
 
@@ -108,3 +109,19 @@ test('parseNdbcLatestObs parses live buoy rows and handles MM missing fields', (
   assert.equal(obs[0].pressureHpa, null);
   assert.equal(obs[1].pressureHpa, 1013.1);
 });
+
+test('parseArgovisMinimalFloats filters future glitches and deduplicates by floatId', () => {
+  const nowMs = Date.parse('2026-11-24T03:00:00Z');
+  const rows = [
+    ['3901994_047', -84.446, -53.91, '2026-12-27T14:48:20.000Z', ['argo_core'], ['3901994_m0']],
+    ['5907109_066', -42.1, -57.1, '2026-11-23T02:00:00.000Z', ['argo_core'], ['5907109_m1']],
+    ['5907109_067', -42.3351, -57.35279, '2026-11-23T04:16:59.000Z', ['argo_core'], ['5907109_m1']],
+    ['1902840_009', -1.21162, -34.18362, '2026-11-23T05:12:33.000Z', ['argo_bgc'], ['1902840_m0']],
+  ];
+  const parsed = parseArgovisMinimalFloats(rows, nowMs);
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0].floatId, '1902840');
+  assert.equal(parsed[1].profileId, '5907109_067');
+  assert.equal(parsed[1].lat, -57.353);
+});
+

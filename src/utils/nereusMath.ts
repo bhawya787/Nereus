@@ -196,6 +196,61 @@ export function parseNdbcLatestObs(text: string): NdbcBuoyObs[] {
   return results;
 }
 
+export interface ArgovisFloatMinimal {
+  profileId: string;
+  floatId: string;
+  lat: number;
+  lon: number;
+  observedAt: string;
+  program: string;
+}
+
+/**
+ * Parses Argovis compression=minimal array rows:
+ * [profileId, lon, lat, isoTimestamp, sources[], metadataIds[]]
+ * Rejects future-dated glitches (> nowMs + 2h), keeps newest per floatId, sorted newest first.
+ */
+export function parseArgovisMinimalFloats(
+  rows: unknown,
+  nowMs: number = Date.now()
+): ArgovisFloatMinimal[] {
+  if (!Array.isArray(rows)) return [];
+  const byFloat = new Map<string, ArgovisFloatMinimal>();
+  const maxAllowedMs = nowMs + 2 * 3600 * 1000;
+  const minAllowedMs = nowMs - 72 * 3600 * 1000;
+
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length < 4) continue;
+    const profileId = String(row[0] ?? '');
+    const lon = Number(row[1]);
+    const lat = Number(row[2]);
+    const observedAt = String(row[3] ?? '');
+    if (!profileId || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    if (lat < -85 || lat > 85 || lon < -180 || lon > 180) continue;
+
+    const tsMs = Date.parse(observedAt);
+    if (!Number.isFinite(tsMs) || tsMs > maxAllowedMs || tsMs < minAllowedMs) continue;
+
+    const floatId = profileId.split('_')[0] || profileId;
+    const sources = Array.isArray(row[4]) ? row[4].map(String).join(', ') : 'argo_core';
+    const existing = byFloat.get(floatId);
+    if (!existing || Date.parse(existing.observedAt) < tsMs) {
+      byFloat.set(floatId, {
+        profileId,
+        floatId,
+        lat: Number(lat.toFixed(3)),
+        lon: Number(lon.toFixed(3)),
+        observedAt,
+        program: sources || 'argo_core',
+      });
+    }
+  }
+
+  return Array.from(byFloat.values()).sort(
+    (a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt)
+  );
+}
+
 export function buildGeoJsonFeatureCollection(detections: DetectionFeature[]) {
   return {
     type: 'FeatureCollection',

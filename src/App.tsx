@@ -46,6 +46,7 @@ export default function App() {
 
       const res = await fetch(force ? '/api/refresh' : '/api/nereus', {
         method: force ? 'POST' : 'GET',
+        cache: 'no-store',
       });
       if (!res.ok) throw new Error(`API returned HTTP ${res.status}`);
       const json = (await res.json()) as NereusDataset;
@@ -62,7 +63,7 @@ export default function App() {
     loadData(false);
     const syncRealtime = async () => {
       try {
-        const res = await fetch('/api/realtime');
+        const res = await fetch('/api/realtime', { cache: 'no-store' });
         if (!res.ok) return;
         const json = (await res.json()) as NereusDataset;
         setData(json);
@@ -74,8 +75,8 @@ export default function App() {
         // silent background live sync retry on next interval
       }
     };
-    const initialLiveTimer = window.setTimeout(syncRealtime, 2500);
-    const interval = window.setInterval(syncRealtime, 60 * 1000);
+    const initialLiveTimer = window.setTimeout(syncRealtime, 800);
+    const interval = window.setInterval(syncRealtime, 30 * 1000);
     return () => {
       window.clearTimeout(initialLiveTimer);
       window.clearInterval(interval);

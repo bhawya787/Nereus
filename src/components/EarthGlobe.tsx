@@ -442,6 +442,7 @@ export function EarthGlobe({
       const visible = detectionsRef.current.filter((d) => activeLayersRef.current[d.signal]);
       for (const det of visible) {
         const isSel = det.id === selectedIdRef.current;
+        const isLive = det.case_type === 'live_station' || det.id.startsWith('rt-');
         const colorHex = getMarkerColorHex(det, isSel);
         const surf = latLonToVector3(det.lat, det.lon, 1.004);
         tempNorm.set(surf.x, surf.y, surf.z).normalize();
@@ -454,7 +455,7 @@ export function EarthGlobe({
         const mat = new THREE.MeshStandardMaterial({
           color: colorHex,
           emissive: colorHex,
-          emissiveIntensity: isSel ? 1.15 : 0.65,
+          emissiveIntensity: isSel ? 1.15 : isLive ? 0.85 : 0.65,
           roughness: 0.25,
           metalness: 0.2,
         });
@@ -462,30 +463,38 @@ export function EarthGlobe({
           color: colorHex,
           side: THREE.DoubleSide,
           transparent: true,
-          opacity: isSel ? 0.95 : 0.72,
+          opacity: isSel ? 0.95 : isLive ? 0.86 : 0.72,
         });
         disposableMarkerResources.push(mat, ringMat);
 
         // 1. Surface anchor ring (aligned flat against sphere tangent)
         const ring = new THREE.Mesh(ringGeo, ringMat);
         ring.rotation.x = -Math.PI / 2;
-        ring.scale.setScalar(isSel ? 1.45 : 1.0);
+        ring.scale.setScalar(isSel ? 1.45 : isLive ? 1.25 : 1.0);
         beacon.add(ring);
+
+        if (isLive) {
+          const outerRing = new THREE.Mesh(ringGeo, ringMat);
+          outerRing.rotation.x = -Math.PI / 2;
+          outerRing.scale.setScalar(isSel ? 1.9 : 1.65);
+          beacon.add(outerRing);
+        }
 
         // 2. Vertical telemetry stem
         const stem = new THREE.Mesh(stemGeo, mat);
-        stem.position.y = 0.016;
+        stem.position.y = isLive ? 0.019 : 0.016;
+        if (isLive) stem.scale.y = 1.2;
         beacon.add(stem);
 
         // 3. Beacon head
         const head = new THREE.Mesh(headGeo, mat);
-        head.position.y = 0.036;
-        head.scale.setScalar(isSel ? 1.35 : 1.0);
+        head.position.y = isLive ? 0.042 : 0.036;
+        head.scale.setScalar(isSel ? 1.35 : isLive ? 1.12 : 1.0);
         beacon.add(head);
 
         // Invisible raycast proxy sphere for effortless clicking
         const hit = new THREE.Mesh(hitGeo, hitMat);
-        hit.position.y = 0.022;
+        hit.position.y = 0.024;
         hit.layers.set(1);
         hit.userData.detection = det;
         beacon.add(hit);

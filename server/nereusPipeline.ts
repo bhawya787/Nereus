@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type {
   CoralReefRecord,
@@ -15,14 +16,20 @@ import {
   classifyCoralAlert,
   evaluateOilWindWindow,
   linearRegression,
+  parseArgovisMinimalFloats,
   parseNdbcLatestObs,
 } from '../src/utils/nereusMath.ts';
 
+const IS_VERCEL = Boolean(
+  process.env.VERCEL || process.env.VERCEL_ENV || process.env.AWS_LAMBDA_FUNCTION_NAME
+);
 const ROOT_DIR = process.cwd();
-const CACHE_DIR = path.join(ROOT_DIR, 'cache');
+const SEED_CACHE_FILE = path.join(ROOT_DIR, 'cache', 'nereus_cache.json');
+const WRITABLE_ROOT = IS_VERCEL ? path.join(os.tmpdir(), 'nereus') : ROOT_DIR;
+const CACHE_DIR = path.join(WRITABLE_ROOT, 'cache');
 const CACHE_FILE = path.join(CACHE_DIR, 'nereus_cache.json');
-const WEB_DATA_DIR = path.join(ROOT_DIR, 'web', 'data');
-const LOGS_DIR = path.join(ROOT_DIR, 'pipeline', 'logs');
+const WEB_DATA_DIR = path.join(WRITABLE_ROOT, 'web', 'data');
+const LOGS_DIR = path.join(WRITABLE_ROOT, 'pipeline', 'logs');
 
 const CAVEATS: Record<SignalId, string> = {
   oil: 'SAR shows dark patches that may be oil ("possible slick"). Look-alikes include low-wind zones (< 2 m/s), algal films, and rain cells. Wind data reduces false alarms; it does not remove them.',
@@ -161,19 +168,37 @@ function parseErddapCsv(csvText: string): Array<Record<string, string>> {
 
 function ensureDirs() {
   for (const dir of [CACHE_DIR, WEB_DATA_DIR, LOGS_DIR]) {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    try {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+    } catch {
+      // Ignore on read-only filesystems
     }
   }
 }
 
-function readDiskCache(): NereusDataset | null {
+function safeWriteFile(filePath: string, data: string) {
   try {
-    if (fs.existsSync(CACHE_FILE)) {
-      return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')) as NereusDataset;
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
     }
+    fs.writeFileSync(filePath, data);
   } catch {
-    // ignore corrupt cache
+    // Ignore non-fatal cache write errors on serverless/read-only environments
+  }
+}
+
+function readDiskCache(): NereusDataset | null {
+  for (const candidate of [CACHE_FILE, SEED_CACHE_FILE]) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return JSON.parse(fs.readFileSync(candidate, 'utf8')) as NereusDataset;
+      }
+    } catch {
+      // ignore corrupt or unreadable cache
+    }
   }
   return null;
 }
@@ -1641,7 +1666,10 @@ async function fetchRealtimeMarineDetections(nowIso: string): Promise<{
   const oilLats = OIL_WATCH_AREAS.map((a) => a.lat).join(',');
   const oilLons = OIL_WATCH_AREAS.map((a) => a.lon).join(',');
 
-  const [ndbcRes, omMarineRes, omWindRes, oilWindRes, eonetRes] = await Promise.all([
+  const argoSince = new Date(Date.now() - 48 * 3600 * 1000).toISOString().slice(0, 19) + 'Z';
+  const argoUntil = new Date(Date.now() + 60 * 1000).toISOString().slice(0, 19) + 'Z';
+
+  const [ndbcRes, omMarineRes, omWindRes, oilWindRes, eonetRes, argoRes, usgsRes] = await Promise.all([
     fetchWithTimeout('https://www.ndbc.noaa.gov/data/latest_obs/latest_obs.txt', {}, 8000).catch(() => null),
     fetchWithTimeout(
       `https://marine-api.open-meteo.com/v1/marine?latitude=${omLats}&longitude=${omLons}&current=sea_surface_temperature,wave_height,ocean_current_velocity`,
@@ -1660,6 +1688,16 @@ async function fetchRealtimeMarineDetections(nowIso: string): Promise<{
     ).catch(() => null),
     fetchWithTimeout(
       'https://eonet.gsfc.nasa.gov/api/v3/events?status=open&category=severeStorms,seaLakeIce&limit=10',
+      {},
+      8000
+    ).catch(() => null),
+    fetchWithTimeout(
+      `https://argovis-api.colorado.edu/argo?startDate=${argoSince}&endDate=${argoUntil}&compression=minimal`,
+      {},
+      8000
+    ).catch(() => null),
+    fetchWithTimeout(
+      'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson',
       {},
       8000
     ).catch(() => null),
@@ -1747,6 +1785,9 @@ async function fetchRealtimeMarineDetections(nowIso: string): Promise<{
       });
 
       recent.sort((a, b) => {
+        const bucketA = Math.floor(Date.parse(a.observedAt) / (15 * 60 * 1000));
+        const bucketB = Math.floor(Date.parse(b.observedAt) / (15 * 60 * 1000));
+        if (bucketB !== bucketA) return bucketB - bucketA;
         const scoreA = (a.waveHeightM ?? 0) * 2 + (a.windMs ?? 0) * 0.25 + (a.waterTempC !== null ? 1 : 0);
         const scoreB = (b.waveHeightM ?? 0) * 2 + (b.windMs ?? 0) * 0.25 + (b.waterTempC !== null ? 1 : 0);
         return scoreB - scoreA;
@@ -1855,24 +1896,139 @@ async function fetchRealtimeMarineDetections(nowIso: string): Promise<{
     }
   }
 
+  // 5. Argovis Autonomous Drifting Argo Ocean Profiling Floats (moving GPS positions)
+  if (argoRes && argoRes.ok) {
+    try {
+      const argoRaw = (await argoRes.json()) as unknown;
+      const floats = parseArgovisMinimalFloats(argoRaw, Date.now());
+      const pickedFloats: typeof floats = [];
+      for (const fl of floats) {
+        if (!pickedFloats.some((p) => Math.hypot(p.lat - fl.lat, p.lon - fl.lon) < 14.0)) {
+          pickedFloats.push(fl);
+        }
+        if (pickedFloats.length >= 10) break;
+      }
+
+      const oceanBasin = (lat: number, lon: number) => {
+        if (lon >= 30 && lon <= 115 && lat <= 30) return 'Indian Ocean Drift';
+        if (lon >= -75 && lon <= 25) return lat >= 0 ? 'North Atlantic Drift' : 'South Atlantic Drift';
+        return lat >= 0 ? 'North Pacific Drift' : 'South Pacific / Southern Ocean';
+      };
+
+      for (const fl of pickedFloats) {
+        detections.push({
+          id: `rt-argo-${fl.floatId}`,
+          signal: 'sst',
+          title: `Argo Float #${fl.floatId} (Live Drift)`,
+          region: oceanBasin(fl.lat, fl.lon),
+          lat: fl.lat,
+          lon: fl.lon,
+          detected_at: fl.observedAt,
+          severity: 'nominal',
+          confidence: 'high',
+          case_type: 'live_station',
+          summary: `Autonomous profiling Argo float surfaced at ${fl.observedAt.slice(0, 16).replace('T', ' ')}Z (${fl.profileId}, ${fl.program}). Position updates as float drifts between cycles.`,
+          metrics: [
+            { label: 'Profile', value: fl.profileId },
+            { label: 'Program', value: fl.program },
+            { label: 'Surfaced', value: fl.observedAt.slice(11, 16) + 'Z' },
+          ],
+          caveat: 'Real-time autonomous ocean profiler surfacing coordinates from Argovis Global Argo Network.',
+          provenance: {
+            source: 'Argovis Global Ocean Argo Network',
+            product_id: fl.profileId,
+            data_date: fl.observedAt.slice(0, 16).replace('T', ' ') + 'Z',
+            processed_at: nowIso,
+            cached: false,
+            endpoint: 'https://argovis-api.colorado.edu/argo',
+          },
+        });
+      }
+    } catch {
+      // ignore parse errors
+    }
+  }
+
+  // 6. USGS Live 24h Global Seismic / Coastal Trench Feed (updates every 60s)
+  if (usgsRes && usgsRes.ok) {
+    try {
+      const uJson = (await usgsRes.json()) as any;
+      const features: any[] = Array.isArray(uJson?.features) ? uJson.features : [];
+      const marineQuakes = features.filter((f) => {
+        const mag = Number(f?.properties?.mag ?? 0);
+        const coords = f?.geometry?.coordinates;
+        if (!Array.isArray(coords) || coords.length < 2 || mag < 2.8) return false;
+        const place = String(f?.properties?.place ?? '');
+        const tsunami = Number(f?.properties?.tsunami ?? 0) === 1;
+        return (
+          tsunami ||
+          mag >= 4.0 ||
+          /ocean|sea|ridge|trench|island|coast|alaska|japan|indonesia|tonga|fiji|chile|hawaii|pacific|atlantic|indian/i.test(
+            place
+          )
+        );
+      });
+
+      const pickedQuakes: any[] = [];
+      for (const f of marineQuakes) {
+        const [lon, lat] = f.geometry.coordinates;
+        if (!pickedQuakes.some((p) => Math.hypot(p.geometry.coordinates[1] - lat, p.geometry.coordinates[0] - lon) < 6.0)) {
+          pickedQuakes.push(f);
+        }
+        if (pickedQuakes.length >= 8) break;
+      }
+
+      for (const f of pickedQuakes) {
+        const [lon, lat, depthKm] = f.geometry.coordinates;
+        const mag = Number(f.properties?.mag ?? 0);
+        const place = String(f.properties?.place ?? 'Offshore Sector');
+        const tsIso = new Date(Number(f.properties?.time ?? Date.now())).toISOString();
+        const tsunamiFlag = Number(f.properties?.tsunami ?? 0) === 1;
+
+        detections.push({
+          id: `rt-usgs-${f.id}`,
+          signal: 'sealevel',
+          title: `M${mag.toFixed(1)} Seismic (${place})`,
+          region: 'Coastal / Trench Monitor',
+          lat: Number(Number(lat).toFixed(3)),
+          lon: Number(Number(lon).toFixed(3)),
+          detected_at: tsIso,
+          severity: tsunamiFlag || mag >= 5.0 ? 'alert' : 'watch',
+          confidence: 'high',
+          case_type: 'live_station',
+          summary: `USGS 60-second rolling feed (${tsIso.slice(11, 16)}Z): M${mag.toFixed(1)} at ${Number(depthKm ?? 10).toFixed(1)} km depth near ${place}.`,
+          metrics: [
+            { label: 'Magnitude', value: mag.toFixed(1), unit: 'M' },
+            { label: 'Depth', value: Number(depthKm ?? 10).toFixed(1), unit: 'km' },
+            { label: 'Tsunami Flag', value: tsunamiFlag ? 'Active' : 'Monitor' },
+          ],
+          caveat: 'Real-time rolling 24-hour seismic feed from USGS Earthquake Hazards Program.',
+          provenance: {
+            source: 'USGS Live Seismic Feed (60s)',
+            product_id: String(f.id),
+            data_date: tsIso.slice(0, 16).replace('T', ' ') + 'Z',
+            processed_at: nowIso,
+            cached: false,
+            endpoint: 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson',
+          },
+        });
+      }
+    } catch {
+      // ignore parse errors
+    }
+  }
+
   return { detections, oilWindById };
 }
 
 let lastRealtimeRefreshMs = 0;
 
-export async function refreshRealtimePoints(): Promise<NereusDataset> {
-  const base = await runNereusPipeline(false);
-  const nowMs = Date.now();
-  if (nowMs - lastRealtimeRefreshMs < 45 * 1000 && base.detections.some((d) => d.id.startsWith('rt-'))) {
-    return base;
-  }
-
-  const nowIso = new Date().toISOString();
-  const { detections: rtDetections, oilWindById } = await fetchRealtimeMarineDetections(nowIso);
-  if (!rtDetections.length && oilWindById.size === 0) {
-    return base;
-  }
-
+function mergeRealtimeIntoDataset(
+  base: NereusDataset,
+  rtDetections: DetectionFeature[],
+  oilWindById: Map<string, number>,
+  nowIso: string
+): NereusDataset {
   const nonRealtime = base.detections.filter((d) => !d.id.startsWith('rt-'));
   const updatedNonRt = nonRealtime.map((d) => {
     if (d.signal === 'oil' && d.case_type === 'latest_scan') {
@@ -1896,9 +2052,19 @@ export async function refreshRealtimePoints(): Promise<NereusDataset> {
     return d;
   });
 
-  const mergedDetections = [...updatedNonRt, ...rtDetections];
+  const seenIds = new Set<string>();
+  const mergedDetections: DetectionFeature[] = [];
+  for (const det of [...updatedNonRt, ...rtDetections]) {
+    if (!seenIds.has(det.id)) {
+      seenIds.add(det.id);
+      mergedDetections.push(det);
+    }
+  }
+
   const sstCount = mergedDetections.filter((d) => d.signal === 'sst').length;
-  const updatedDataset: NereusDataset = {
+  const sealevelCount = mergedDetections.filter((d) => d.signal === 'sealevel').length;
+
+  return {
     ...base,
     last_refresh_utc: nowIso,
     earth_sun_utc: nowIso,
@@ -1913,11 +2079,35 @@ export async function refreshRealtimePoints(): Promise<NereusDataset> {
           processed_at: nowIso,
         },
       },
+      sealevel: {
+        ...base.layers.sealevel,
+        count: sealevelCount,
+        provenance: {
+          ...base.layers.sealevel.provenance,
+          processed_at: nowIso,
+        },
+      },
     },
   };
+}
 
+export async function refreshRealtimePoints(): Promise<NereusDataset> {
+  const base = await runNereusPipeline(false);
+  const nowMs = Date.now();
+  if (nowMs - lastRealtimeRefreshMs < 12 * 1000 && base.detections.some((d) => d.id.startsWith('rt-'))) {
+    return base;
+  }
+
+  const nowIso = new Date().toISOString();
+  const { detections: rtDetections, oilWindById } = await fetchRealtimeMarineDetections(nowIso);
+  if (!rtDetections.length && oilWindById.size === 0) {
+    return base;
+  }
+
+  const updatedDataset = mergeRealtimeIntoDataset(base, rtDetections, oilWindById, nowIso);
   inMemoryCache = updatedDataset;
   lastRealtimeRefreshMs = nowMs;
+  safeWriteFile(CACHE_FILE, JSON.stringify(updatedDataset, null, 2));
   return updatedDataset;
 }
 
@@ -1931,9 +2121,20 @@ export async function runNereusPipeline(forceRefresh = false): Promise<NereusDat
   }
   if (!forceRefresh && prevCache) {
     const ageMs = Date.now() - new Date(prevCache.generated_at).getTime();
+    const gfwNeeded = Boolean(process.env.GFW_API_TOKEN) && Boolean(prevCache.vessels_summary?.provenance?.requires_credentials);
     if (ageMs < 5 * 60 * 1000) {
       inMemoryCache = prevCache;
       return prevCache;
+    }
+    if (IS_VERCEL && !gfwNeeded) {
+      const nowIso = new Date().toISOString();
+      const rt = await fetchRealtimeMarineDetections(nowIso);
+      const hydrated = rt.detections.length
+        ? mergeRealtimeIntoDataset(prevCache, rt.detections, rt.oilWindById, nowIso)
+        : prevCache;
+      inMemoryCache = hydrated;
+      lastRealtimeRefreshMs = Date.now();
+      return hydrated;
     }
   }
   if (!forceRefresh && inFlightPipeline) {
@@ -1957,7 +2158,6 @@ export async function runNereusPipeline(forceRefresh = false): Promise<NereusDat
       fetchRealtimeMarineDetections(nowIso),
     ]);
 
-  lastRealtimeRefreshMs = Date.now();
   const acidification = buildAcidificationStatus(nowIso, logs);
 
   const reefRegionById = new Map(REEF_POINTS.map((r) => [r.id, r.region]));
@@ -2139,9 +2339,9 @@ export async function runNereusPipeline(forceRefresh = false): Promise<NereusDat
   };
 
   inMemoryCache = dataset;
-  fs.writeFileSync(CACHE_FILE, JSON.stringify(dataset, null, 2));
-  fs.writeFileSync(path.join(WEB_DATA_DIR, 'manifest.json'), JSON.stringify(dataset, null, 2));
-  fs.writeFileSync(
+  safeWriteFile(CACHE_FILE, JSON.stringify(dataset, null, 2));
+  safeWriteFile(path.join(WEB_DATA_DIR, 'manifest.json'), JSON.stringify(dataset, null, 2));
+  safeWriteFile(
     path.join(LOGS_DIR, 'last_run.log'),
     logs.map((l) => `[${l.timestamp}] [${l.module}] ${l.status.toUpperCase()} ${l.url} — ${l.note}`).join('\n') + '\n'
   );
